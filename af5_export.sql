@@ -98,17 +98,18 @@ fields as (
   oid,
   relname,
   attname,
+  qattname,
   case
     when ismodule and istype then quote_literal('(select id from domain_object_type_id where lower(name) = ''ss_module'')')
     when ismoduletype and istype then quote_literal('(select id from domain_object_type_id where lower(name) = ''ss_moduletype'')')
     when ismodule and not istype then '''(select mod.id from ss_module mod join ss_moduletype mtype on mtype.id = mod.type where alias = ''|| ' ||
-    'coalesce((select quote_literal(alias) from ss_module mod join ss_moduletype mtype on mtype.id = mod.type where mod.id = ' || attname::text || ' limit 1), ''null'') || '' order by mod.id limit 1)'''
+    'coalesce((select quote_literal(alias) from ss_module mod join ss_moduletype mtype on mtype.id = mod.type where mod.id = ' || qattname || ' limit 1), ''null'') || '' order by mod.id limit 1)'''
     when ismoduletype and not istype then '''(select mtype.id from ss_moduletype mtype where alias = ''|| ' ||
-    'coalesce((select quote_literal(alias) from ss_moduletype where id = ' || attname::text || '), ''null'') ||'')'''
+    'coalesce((select quote_literal(alias) from ss_moduletype where id = ' || qattname || '), ''null'') ||'')'''
     when coltype ~ '^(text|character varying)'
-      then 'replace(replace(quote_nullable(' || attname::text || ')::text, chr(10), '''''' || chr(10) || ''''''), chr(13), '''''' || chr(13) || '''''')'
-    when coltype ~ '^(int|bigint)' then 'coalesce(' || attname::text || '::text, ''null'')'
-    else 'quote_nullable(' || attname::text || ')::text'
+      then 'replace(replace(quote_nullable(' || qattname || ')::text, chr(10), '''''' || chr(10) || ''''''), chr(13), '''''' || chr(13) || '''''')'
+    when coltype ~ '^(int|bigint|smallint)' then 'coalesce(' || qattname || '::text, ''null'')'
+    else 'quote_nullable(' || qattname || ')::text'
   end fld, attnum, coalesce(ismodule, false) or coalesce(ismoduletype, false) as isspecial, istype, ismaintype
   from (
     select
@@ -121,10 +122,11 @@ fields as (
              attname || '_type' = any(array_agg(attname::text) over (partition by tables.oid))
              else false
            end as ismaintype,
-           attnum, attname::text as attname, coltype, ismodule, ismoduletype
+           attnum, attname::text as attname, qattname, coltype, ismodule, ismoduletype
     from inserttables tables
     join pg_catalog.pg_attribute att on att.attrelid = tables.oid
     join lateral (select pg_catalog.format_type(att.atttypid, att.atttypmod) as coltype) t on true
+    join lateral (select '"' || attname::text || '"' as qattname) t2 on true
     left join lateral (
     select (frel.relname = 'ss_module') as ismodule, (frel.relname = 'ss_moduletype') as ismoduletype
     from pg_catalog.pg_constraint const
@@ -138,7 +140,7 @@ fields as (
 ),
 
 fieldsstr as (
-  select oid, string_agg(fld, ' || '','' || ' order by attnum) as str
+  select oid, string_agg(fld, ' || '','' || ' order by attnum) as str, array_agg(qattname order by attnum) as atts
   from fields group by oid
 ),
 
@@ -312,7 +314,17 @@ insertblock as
             || ' returning *),''')
           where level = 1
                 union all
-          select 4, format((select v from cntstr), quote_literal('inst_' || table_name ||' as (insert into ' || table_name || ' values '))
+          select 4, format((select v from cntstr), quote_literal(
+            'inst_' || table_name ||' as (insert into ' || table_name ||
+            '(' || array_to_string(array['id', 'id_type'] || (case when level = 1 then array[
+                'created_date', 'updated_date', 'created_by', 'created_by_type', 'updated_by', 'updated_by_type',
+                'status', 'status_type', 'access_object_id'
+                ] else array[]::text[] end) || coalesce((
+                    select atts from fieldsstr where oid = table_oid),
+                    array[]::text[]
+                ), ', ') ||
+            ') values ')
+            )
                 union all
           select 5, format((select v from cntstr), '(case when row_number() over () = 1 then '''' else '','' end) || ' ||
                 '''((select dstid from cur_ids_map where srcid = ''|| id || ''), (select dsttype from cur_ids_map where srcid = ''|| id || '')'' || ' ||
